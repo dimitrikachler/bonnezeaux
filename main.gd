@@ -4,10 +4,10 @@ extends Node3D
 ## project stays easy to edit by hand. Replace/extend freely.
 
 # --- Boat physics tunables -------------------------------------------------
-const MAX_SPEED := 22.0
-const ACCEL := 14.0
-const DRAG := 1.6
-const TURN := 1.7            # rad/s at full speed
+const MAX_SPEED := 28.0
+const ACCEL := 26.0
+const DRAG := 1.3
+const TURN := 2.8            # rad/s at full speed
 const CAM_OFFSET := Vector3(40, 50, -40)
 
 var heading := 0.0           # radians, 0 = +Z
@@ -272,7 +272,7 @@ func _process(delta: float) -> void:
 	speed = clampf(speed, -MAX_SPEED * 0.4, MAX_SPEED)
 
 	# need some speed before the rudder bites
-	var steer_scale := minf(1.0, absf(speed) / 6.0)
+	var steer_scale := minf(1.0, absf(speed) / 3.0)
 	heading += steer * TURN * delta * steer_scale * signf(speed if speed != 0.0 else 1.0)
 
 	var nx := boat.position.x + sin(heading) * speed * delta
