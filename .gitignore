@@ -1,4 +1,6 @@
-node_modules
-dist
-*.local
-.DS_Store
+# Godot 4+ specific ignores
+.godot/
+/android/
+
+# Web export output (built in CI, not committed)
+/build/

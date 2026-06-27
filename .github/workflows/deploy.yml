@@ -14,21 +14,49 @@ concurrency:
   group: pages
   cancel-in-progress: true
 
+env:
+  GODOT_VERSION: 4.7-stable
+  EXPORT_PRESET: Web
+
 jobs:
   build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
-        with:
-          node-version: 20
-          cache: npm
-      - run: npm ci
-      - run: npm run build
+
+      - name: Download Godot headless + export templates
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}"
+          wget -qO godot.zip      "${BASE}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
+          wget -qO templates.tpz  "${BASE}/Godot_v${GODOT_VERSION}_export_templates.tpz"
+          unzip -q godot.zip
+          mv Godot_v${GODOT_VERSION}_linux.x86_64 godot
+          chmod +x godot
+          # templates ship inside a "templates/" dir; Godot wants them under
+          # ~/.local/share/godot/export_templates/<version>.stable/
+          VER_DIR="${GODOT_VERSION%-stable}.stable"
+          mkdir -p "$HOME/.local/share/godot/export_templates/${VER_DIR}"
+          unzip -q templates.tpz
+          mv templates/* "$HOME/.local/share/godot/export_templates/${VER_DIR}/"
+
+      - name: Import project
+        # First run imports resources and generates the .godot cache. It can exit
+        # non-zero on the very first import; that's expected, so don't fail on it.
+        run: ./godot --headless --import . || true
+
+      - name: Export web build
+        run: |
+          set -euo pipefail
+          mkdir -p build/web
+          ./godot --headless --export-release "${EXPORT_PRESET}" build/web/index.html
+          test -f build/web/index.html
+
       - uses: actions/configure-pages@v5
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: dist
+          path: build/web
+
   deploy:
     needs: build
     runs-on: ubuntu-latest
