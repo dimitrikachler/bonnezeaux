@@ -24,15 +24,31 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download Godot headless + export templates
+      # The 1.2 GB export templates rarely change, so cache them keyed by Godot
+      # version. First build downloads + populates the cache; later builds restore
+      # it in seconds. Bumping GODOT_VERSION invalidates the cache automatically.
+      - name: Cache export templates
+        id: templates-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.local/share/godot/export_templates
+          key: godot-templates-${{ env.GODOT_VERSION }}
+
+      - name: Download Godot headless
         run: |
           set -euo pipefail
           BASE="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}"
-          wget -qO godot.zip      "${BASE}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
-          wget -qO templates.tpz  "${BASE}/Godot_v${GODOT_VERSION}_export_templates.tpz"
+          wget -qO godot.zip "${BASE}/Godot_v${GODOT_VERSION}_linux.x86_64.zip"
           unzip -q godot.zip
           mv Godot_v${GODOT_VERSION}_linux.x86_64 godot
           chmod +x godot
+
+      - name: Download export templates (cache miss only)
+        if: steps.templates-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          BASE="https://github.com/godotengine/godot/releases/download/${GODOT_VERSION}"
+          wget -qO templates.tpz "${BASE}/Godot_v${GODOT_VERSION}_export_templates.tpz"
           # templates ship inside a "templates/" dir; Godot wants them under
           # ~/.local/share/godot/export_templates/<version>.stable/
           VER_DIR="${GODOT_VERSION%-stable}.stable"
