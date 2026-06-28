@@ -10,14 +10,31 @@ const DRAG := 1.3
 const TURN := 2.8            # rad/s at full speed
 const CAM_OFFSET := Vector3(40, 50, -40)
 
+# --- Wind / sailing tunables ----------------------------------------------
+const WIND_ACCEL := 24.0     # how hard a well-trimmed sail pushes the boat
+const WIND_DRIFT := 0.35     # rad/s random walk of the wind direction
+const WIND_STRENGTH_MIN := 0.6
+const WIND_STRENGTH_MAX := 1.0
+const SAIL_TRIM_SPEED := 1.8 # rad/s the player can swing the sail (Q/E)
+const SAIL_TRIM_LIMIT := 1.4 # max sail angle off the boat's centreline
+
 var heading := 0.0           # radians, 0 = +Z
 var speed := 0.0
 var elapsed := 0.0
 
+var wind_dir := 0.0          # radians, direction the wind blows TOWARD
+var wind_strength := 0.8
+var wind_strength_target := 0.8
+var sail_angle := 0.0        # radians, sail trim relative to the boat
+
 var boat: Node3D
+var sail_node: MeshInstance3D
+var sail_mat: StandardMaterial3D
+var wind_arrow: Node3D
 var water: MeshInstance3D
 var water_mat: ShaderMaterial
 var cam: Camera3D
+var status_label: Label
 
 # islands as {pos: Vector3, radius: float} for simple collision
 var islands: Array = []
@@ -36,8 +53,10 @@ func _ready() -> void:
 	_make_island(Vector3(-10, 0, 55), 8.0)
 	_make_island(Vector3(60, 0, -40), 9.0)
 	_build_boat()
+	_build_wind_arrow()
 	_build_camera()
 	_build_hud()
+	wind_dir = randf() * TAU
 
 
 func _build_environment() -> void:
@@ -197,15 +216,45 @@ func _build_boat() -> void:
 	mast.position = Vector3(0, 2.4, 0.1)
 	boat.add_child(mast)
 
+	# The sail is a thin plane that pivots around the mast. We rotate this node
+	# with Q/E to trim it, and tint it green/red to show how well it catches wind.
 	var sail_mesh := BoxMesh.new()
 	sail_mesh.size = Vector3(0.06, 2.2, 1.6)
-	var sail := MeshInstance3D.new()
-	sail.mesh = sail_mesh
-	sail.material_override = _solid_mat(Color(0.95, 0.94, 0.88))
-	sail.position = Vector3(0, 2.4, 0.15)
-	boat.add_child(sail)
+	sail_mat = _solid_mat(Color(0.95, 0.94, 0.88))
+	sail_node = MeshInstance3D.new()
+	sail_node.mesh = sail_mesh
+	sail_node.material_override = sail_mat
+	sail_node.position = Vector3(0, 2.4, 0.1)
+	boat.add_child(sail_node)
 
 	add_child(boat)
+
+
+func _build_wind_arrow() -> void:
+	# Floating arrow above the boat that points the way the wind is blowing.
+	wind_arrow = Node3D.new()
+	var arrow_mat := _solid_mat(Color(0.2, 0.85, 1.0))
+
+	var shaft_mesh := BoxMesh.new()
+	shaft_mesh.size = Vector3(0.25, 0.25, 2.6)
+	var shaft := MeshInstance3D.new()
+	shaft.mesh = shaft_mesh
+	shaft.material_override = arrow_mat
+	wind_arrow.add_child(shaft)
+
+	var head_mesh := CylinderMesh.new()
+	head_mesh.top_radius = 0.0
+	head_mesh.bottom_radius = 0.7
+	head_mesh.height = 1.2
+	head_mesh.radial_segments = 6
+	var head := MeshInstance3D.new()
+	head.mesh = head_mesh
+	head.material_override = arrow_mat
+	head.rotation_degrees = Vector3(90, 0, 0)  # point the cone along +Z
+	head.position = Vector3(0, 0, 1.8)
+	wind_arrow.add_child(head)
+
+	add_child(wind_arrow)
 
 
 func _build_camera() -> void:
@@ -220,13 +269,22 @@ func _build_camera() -> void:
 func _build_hud() -> void:
 	var layer := CanvasLayer.new()
 	var label := Label.new()
-	label.text = "desktop: W/S sail · A/D steer    |    mobile: tap left / right to steer"
+	label.text = "W/S throttle · A/D steer · Q/E trim sail    |    mobile: tap left / right to steer"
 	label.add_theme_color_override("font_color", Color.WHITE)
 	label.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.5))
 	label.add_theme_constant_override("shadow_offset_y", 1)
 	label.set_anchors_preset(Control.PRESET_CENTER_BOTTOM)
 	label.position.y = -34
 	layer.add_child(label)
+
+	# live wind / sail readout, top-left
+	status_label = Label.new()
+	status_label.add_theme_color_override("font_color", Color.WHITE)
+	status_label.add_theme_color_override("font_shadow_color", Color(0, 0, 0, 0.5))
+	status_label.add_theme_constant_override("shadow_offset_y", 1)
+	status_label.position = Vector2(14, 10)
+	layer.add_child(status_label)
+
 	add_child(layer)
 
 
@@ -266,8 +324,39 @@ func _process(delta: float) -> void:
 		steer -= 1.0
 	steer = clampf(steer, -1.0, 1.0)
 
+	# trim the sail with Q / E
+	var trim := 0.0
+	if Input.is_physical_key_pressed(KEY_Q):
+		trim += 1.0
+	if Input.is_physical_key_pressed(KEY_E):
+		trim -= 1.0
+	sail_angle = clampf(sail_angle + trim * SAIL_TRIM_SPEED * delta, -SAIL_TRIM_LIMIT, SAIL_TRIM_LIMIT)
+
+	# --- wind ---
+	# direction does a slow random walk; strength drifts toward a roaming target
+	wind_dir += randf_range(-1.0, 1.0) * WIND_DRIFT * delta
+	if randf() < delta * 0.3:
+		wind_strength_target = randf_range(WIND_STRENGTH_MIN, WIND_STRENGTH_MAX)
+	wind_strength = lerpf(wind_strength, wind_strength_target, delta * 0.5)
+
+	# How much thrust the sail makes: the wind pushes on the sail face (its
+	# normal), and only the part of that push aligned with the boat's heading
+	# drives us forward. Trim the sail (Q/E) to align the normal between the
+	# wind and where you're pointing.
+	var sail_world := heading + sail_angle
+	var sail_normal := Vector2(cos(sail_world), -sin(sail_world))
+	var wind_vec := Vector2(sin(wind_dir), cos(wind_dir))
+	var forward := Vector2(sin(heading), cos(heading))
+	var catch := wind_vec.dot(sail_normal)                 # wind hitting the face
+	var thrust := wind_strength * catch * sail_normal.dot(forward)
+	var sail_drive := maxf(0.0, thrust)                    # no sailing backwards
+	var efficiency := clampf(sail_drive / maxf(wind_strength, 0.01), 0.0, 1.0)
+
+	# tint the sail: red = luffing/badly trimmed, green = drawing well
+	sail_mat.albedo_color = Color(0.95, 0.94, 0.88).lerp(Color(0.3, 1.0, 0.4), efficiency)
+
 	# --- physics ---
-	speed += throttle * ACCEL * delta
+	speed += (throttle * ACCEL + sail_drive * WIND_ACCEL) * delta
 	speed -= speed * DRAG * delta
 	speed = clampf(speed, -MAX_SPEED * 0.4, MAX_SPEED)
 
@@ -298,6 +387,11 @@ func _process(delta: float) -> void:
 	boat.position.y = sin(t * 1.5) * 0.25
 	boat.rotation.z = sin(t * 1.2) * 0.04
 	boat.rotation.x = sin(t * 0.9) * 0.03
+	sail_node.rotation.y = sail_angle
+
+	# wind arrow floats above the boat, pointing where the wind blows
+	wind_arrow.position = boat.position + Vector3(0, 9, 0)
+	wind_arrow.rotation.y = wind_dir
 
 	# water + camera follow the boat so the sea feels endless
 	water.position.x = boat.position.x
@@ -306,3 +400,10 @@ func _process(delta: float) -> void:
 
 	cam.position = boat.position + CAM_OFFSET
 	cam.look_at(boat.position, Vector3.UP)
+
+	status_label.text = "wind %d°  strength %.2f\nsail trim %+d°  catching %d%%" % [
+		int(rad_to_deg(wind_dir)) % 360,
+		wind_strength,
+		int(rad_to_deg(sail_angle)),
+		int(efficiency * 100.0),
+	]
