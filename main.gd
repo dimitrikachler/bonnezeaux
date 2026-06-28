@@ -4,19 +4,22 @@ extends Node3D
 ## project stays easy to edit by hand. Replace/extend freely.
 
 # --- Boat physics tunables -------------------------------------------------
-const MAX_SPEED := 28.0
+const MAX_SPEED := 36.0
 const ACCEL := 26.0
 const DRAG := 1.3
 const TURN := 2.8            # rad/s at full speed
 const CAM_OFFSET := Vector3(40, 50, -40)
 
 # --- Wind / sailing tunables ----------------------------------------------
-const WIND_ACCEL := 24.0     # how hard a well-trimmed sail pushes the boat
-const WIND_DRIFT := 0.35     # rad/s random walk of the wind direction
-const WIND_STRENGTH_MIN := 0.6
+const WIND_ACCEL := 48.0     # how hard a well-trimmed sail pushes the boat
+const WIND_DRIFT := 1.1      # rad/s random walk of the wind direction (gusty/shifty)
+const WIND_SHIFT_CHANCE := 0.8   # per-second chance the wind picks a new strength
+const WIND_STRENGTH_MIN := 0.65
 const WIND_STRENGTH_MAX := 1.0
-const SAIL_TRIM_SPEED := 1.8 # rad/s the player can swing the sail (Q/E)
-const SAIL_TRIM_LIMIT := 1.4 # max sail angle off the boat's centreline
+const WIND_SPEED_SCALE := 20.0   # true wind speed in boat-speed units (for apparent wind)
+const NO_GO := deg_to_rad(43.0)  # can't sail closer than this to the wind
+const SHEET_SPEED := 1.6     # rad/s the player can sheet the sail in/out (Q/E)
+const SHEET_MAX := PI / 2.0  # fully eased = sail 90° out
 
 var heading := 0.0           # radians, 0 = +Z
 var speed := 0.0
@@ -25,7 +28,10 @@ var elapsed := 0.0
 var wind_dir := 0.0          # radians, direction the wind blows TOWARD
 var wind_strength := 0.8
 var wind_strength_target := 0.8
-var sail_angle := 0.0        # radians, sail trim relative to the boat
+var sail_sheet := 0.5        # how far the sail is eased out, 0 (in tight) .. SHEET_MAX
+var sail_angle := 0.0        # actual visual sail angle (sheet, on the leeward side)
+var efficiency := 0.0        # how well the sail is drawing, 0..1 (for HUD/tint)
+var awa := 0.0               # apparent wind angle off the bow, 0 = dead upwind
 
 var boat: Node3D
 var sail_node: MeshInstance3D
@@ -324,35 +330,52 @@ func _process(delta: float) -> void:
 		steer -= 1.0
 	steer = clampf(steer, -1.0, 1.0)
 
-	# trim the sail with Q / E
-	var trim := 0.0
+	# sheet the sail with Q / E (Q eases out, E sheets in tight)
+	var sheet := 0.0
 	if Input.is_physical_key_pressed(KEY_Q):
-		trim += 1.0
+		sheet += 1.0
 	if Input.is_physical_key_pressed(KEY_E):
-		trim -= 1.0
-	sail_angle = clampf(sail_angle + trim * SAIL_TRIM_SPEED * delta, -SAIL_TRIM_LIMIT, SAIL_TRIM_LIMIT)
+		sheet -= 1.0
+	sail_sheet = clampf(sail_sheet + sheet * SHEET_SPEED * delta, 0.0, SHEET_MAX)
 
-	# --- wind ---
-	# direction does a slow random walk; strength drifts toward a roaming target
-	wind_dir += randf_range(-1.0, 1.0) * WIND_DRIFT * delta
-	if randf() < delta * 0.3:
+	# --- wind: gusty, shifty true wind ---
+	wind_dir = wrapf(wind_dir + randf_range(-1.0, 1.0) * WIND_DRIFT * delta, 0.0, TAU)
+	if randf() < delta * WIND_SHIFT_CHANCE:
 		wind_strength_target = randf_range(WIND_STRENGTH_MIN, WIND_STRENGTH_MAX)
-	wind_strength = lerpf(wind_strength, wind_strength_target, delta * 0.5)
+	wind_strength = lerpf(wind_strength, wind_strength_target, delta * 0.8)
 
-	# How much thrust the sail makes: the wind pushes on the sail face (its
-	# normal), and only the part of that push aligned with the boat's heading
-	# drives us forward. Trim the sail (Q/E) to align the normal between the
-	# wind and where you're pointing.
-	var sail_world := heading + sail_angle
-	var sail_normal := Vector2(cos(sail_world), -sin(sail_world))
-	var wind_vec := Vector2(sin(wind_dir), cos(wind_dir))
+	# Apparent wind = true wind minus the boat's own motion. This is what the
+	# sail actually feels, and it shifts forward as the boat speeds up.
 	var forward := Vector2(sin(heading), cos(heading))
-	var catch := wind_vec.dot(sail_normal)                 # wind hitting the face
-	var thrust := wind_strength * catch * sail_normal.dot(forward)
-	var sail_drive := maxf(0.0, thrust)                    # no sailing backwards
-	var efficiency := clampf(sail_drive / maxf(wind_strength, 0.01), 0.0, 1.0)
+	var true_wind := Vector2(sin(wind_dir), cos(wind_dir)) * (wind_strength * WIND_SPEED_SCALE)
+	var app_wind := true_wind - forward * speed   # vector the wind blows TOWARD, boat frame
+	var app_from := -app_wind                     # points back to where it comes from
+	var app_speed := app_wind.length()
 
-	# tint the sail: red = luffing/badly trimmed, green = drawing well
+	# Angle between the bow and where the wind comes from. 0 = dead upwind.
+	awa = absf(forward.angle_to(app_from)) if app_from.length() > 0.01 else 0.0
+
+	# Point of sail: nothing in the no-go zone, ramps up to a fast beam reach,
+	# eases off a little dead downwind (running on drag alone is slower).
+	var pos_power := 0.0
+	if awa > NO_GO:
+		var ramp := clampf((awa - NO_GO) / deg_to_rad(27.0), 0.0, 1.0)
+		var run_falloff := 1.0 - 0.30 * clampf((awa - deg_to_rad(120.0)) / deg_to_rad(60.0), 0.0, 1.0)
+		pos_power = ramp * run_falloff
+
+	# Correct sheet for this point of sail: in tight upwind, eased out downwind.
+	var optimal_sheet := clampf((awa - NO_GO) * 0.62, 0.0, SHEET_MAX)
+	var trim_quality := clampf(1.0 - absf(sail_sheet - optimal_sheet) / deg_to_rad(45.0), 0.0, 1.0)
+
+	var app_norm := clampf(app_speed / WIND_SPEED_SCALE, 0.0, 1.6)
+	var sail_drive := pos_power * trim_quality * app_norm
+	efficiency = clampf(pos_power * trim_quality, 0.0, 1.0)
+
+	# show the sail eased to the leeward side, by the sheeted amount
+	var lee := signf(forward.angle_to(app_from))
+	sail_angle = sail_sheet * (lee if lee != 0.0 else 1.0)
+
+	# tint the sail: pale = luffing/badly trimmed, green = drawing well
 	sail_mat.albedo_color = Color(0.95, 0.94, 0.88).lerp(Color(0.3, 1.0, 0.4), efficiency)
 
 	# --- physics ---
@@ -401,9 +424,20 @@ func _process(delta: float) -> void:
 	cam.position = boat.position + CAM_OFFSET
 	cam.look_at(boat.position, Vector3.UP)
 
-	status_label.text = "wind %d°  strength %.2f\nsail trim %+d°  catching %d%%" % [
+	var awa_deg := rad_to_deg(awa)
+	var pos_name := "running"
+	if awa_deg <= rad_to_deg(NO_GO):
+		pos_name = "IN IRONS (no-go — tack!)"
+	elif awa_deg < 60.0:
+		pos_name = "close-hauled"
+	elif awa_deg < 100.0:
+		pos_name = "beam reach"
+	elif awa_deg < 150.0:
+		pos_name = "broad reach"
+	status_label.text = "wind %d°  strength %.2f\npoint of sail: %s  (%d° off bow)\ncatching %d%%" % [
 		int(rad_to_deg(wind_dir)) % 360,
 		wind_strength,
-		int(rad_to_deg(sail_angle)),
+		pos_name,
+		int(awa_deg),
 		int(efficiency * 100.0),
 	]
